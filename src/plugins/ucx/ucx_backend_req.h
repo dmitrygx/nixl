@@ -50,7 +50,6 @@ public:
     void
     init(const ucx_connection_ptr_t &conn, const nixlUcxEp &ep) {
         NIXL_ASSERT(requests_.empty());
-        NIXL_ASSERT(notifReq_ == nullptr);
         conn_ = conn;
         ep_ = &ep;
         notifState_ = notif_state_t::NONE;
@@ -119,10 +118,6 @@ public:
         size_t incomplete_reqs = 0;
         for (nixlUcxReq req : requests_) {
             incomplete_reqs += releaseRequest(req);
-        }
-        const nixlUcxReq notif_req = notifReq_.exchange(nullptr);
-        if (notif_req != nullptr) {
-            incomplete_reqs += releaseRequest(notif_req);
         }
         if (incomplete_reqs != 0) {
             NIXL_WARN << "request handle " << this << " released with " << incomplete_reqs
@@ -221,33 +216,19 @@ private:
 
     void
     sendNotif() {
-        nixlUcxReq req = nullptr;
+        // The transfer is complete when its data and flush are complete and
+        // its notification is posted. The worker owns the notification send,
+        // so releasing or reusing this handle cannot invalidate its payload.
         const nixl_status_t status = getEp().sendAm(
-            nixl::ucx::am_cb_op_t::NOTIF_STR, std::move(notif_), UCP_AM_SEND_FLAG_EAGER, &req);
+            nixl::ucx::am_cb_op_t::NOTIF_STR, std::move(notif_), UCP_AM_SEND_FLAG_EAGER);
         notif_.clear();
         notifState_ = notif_state_t::SENT;
-        if (status == NIXL_IN_PROG) {
-            notifReq_ = req;
-        } else {
-            notifStatus_ = status;
-        }
+        notifStatus_ = (status == NIXL_IN_PROG) ? NIXL_SUCCESS : status;
     }
 
     [[nodiscard]] nixl_status_t
     notifStatus() {
         flushed();
-
-        const nixlUcxReq req = notifReq_.load(std::memory_order_acquire);
-        if (req != nullptr) {
-            const nixl_status_t status = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
-            if (status == NIXL_IN_PROG) {
-                return status;
-            }
-
-            worker_->reqRelease(req);
-            notifReq_ = nullptr;
-            notifStatus_ = status;
-        }
 
         const nixl_status_t status = notifStatus_.load(std::memory_order_acquire);
         if ((status == NIXL_SUCCESS) || (status == NIXL_IN_PROG)) {
@@ -273,7 +254,6 @@ private:
     void
     reset() noexcept {
         requests_.clear();
-        notifReq_ = nullptr;
         notif_.clear();
         conn_.reset();
         ep_ = nullptr;
@@ -294,7 +274,6 @@ private:
     absl::InlinedVector<nixlUcxReq, max_requests> requests_;
     nixlUcxWorker *worker_ = nullptr;
     std::string notif_;
-    std::atomic<nixlUcxReq> notifReq_{nullptr};
     std::atomic<nixl_status_t> notifStatus_{NIXL_SUCCESS};
     std::atomic<notif_state_t> notifState_{notif_state_t::NONE};
 };

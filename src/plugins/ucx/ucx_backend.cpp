@@ -60,6 +60,18 @@ errHandlingModeFromParams(const nixl_b_params_t *custom_params) {
         custom_params, std::string(nixl_ucx_err_handling_param_name));
     return opt ? ucx_err_mode_from_string(*opt) : UCP_ERR_HANDLING_MODE_PEER;
 }
+
+[[nodiscard]] std::chrono::milliseconds
+notifDrainTimeoutFromParams(const nixl_b_params_t *custom_params) {
+    const auto timeout =
+        nixl::getBackendParamDefaulted(custom_params,
+                                       std::string(nixl_ucx_notif_drain_timeout_param_name),
+                                       nixl_ucx_notif_drain_timeout.count());
+    if (timeout < 0) {
+        throw std::invalid_argument("UCX notification drain timeout must be nonnegative");
+    }
+    return std::chrono::milliseconds(timeout);
+}
 } // namespace
 
 /****************************************
@@ -96,6 +108,11 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
 nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params, size_t num_dedicated_workers)
     : nixlBackendEngine(&init_params),
       errHandlingMode_(errHandlingModeFromParams(init_params.customParams)),
+      notifDrainTimeout_(notifDrainTimeoutFromParams(init_params.customParams)),
+      notifWarnThreshold_(
+          nixl::getBackendParamDefaulted(init_params.customParams,
+                                         std::string(nixl_ucx_notif_warn_threshold_param_name),
+                                         nixl_ucx_notif_warn_threshold)),
       sharedWorkerIndex_(1),
       sglEnabled_(sglEnabledFromConfig()),
       traceSink_(init_params.traceSink) {
@@ -161,6 +178,19 @@ tlsSharedWorkerMap() {
 // Through parent destructor the unregister will be called.
 nixlUcxEngine::~nixlUcxEngine() {
     tlsSharedWorkerMap().erase(this);
+    const auto deadline = nixlUcxAmDrainDeadline(notifDrainTimeout_);
+    for (const auto &worker : workers_) {
+        worker->beginAmShutdown(deadline);
+    }
+    for (const auto &worker : workers_) {
+        if (!worker->drainAmSends(notifDrainTimeout_)) {
+            NIXL_WARN << "UCX AM drain timed out with " << worker->getPendingAmSends()
+                      << " pending sends on worker " << worker->getName();
+        }
+    }
+    // Endpoint and worker destructors share the deadline above. They cannot
+    // start a fresh timeout for every peer or worker after this budget expires.
+    remoteConnMap.clear();
 }
 
 /****************************************
@@ -186,6 +216,19 @@ nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
 
     if (it == remoteConnMap.end()) {
         return NIXL_ERR_NOT_FOUND;
+    }
+
+    const auto deadline = nixlUcxAmDrainDeadline(notifDrainTimeout_);
+    for (const auto &ep : it->second->eps) {
+        ep->beginAmShutdown(deadline);
+    }
+    // A request handle can still hold this connection after map removal, so
+    // drain here rather than relying only on endpoint destruction.
+    for (const auto &ep : it->second->eps) {
+        if (!ep->drainAmSends(notifDrainTimeout_)) {
+            NIXL_WARN << "UCX AM drain timed out with " << ep->getPendingAmSends()
+                      << " pending sends on ep " << ep->getEp();
+        }
     }
 
     // thread safety?
@@ -762,10 +805,9 @@ nixlUcxEngine::buildNotif(const std::string &msg,
 nixl_status_t
 nixlUcxEngine::notifSendPriv(const std::string &remote_agent,
                              const std::string &msg,
-                             const nixlUcxEp &ep,
-                             nixlUcxReq *req) const {
+                             const nixlUcxEp &ep) const {
     return ep.sendAm(
-        nixl::ucx::am_cb_op_t::NOTIF_STR, buildNotif(msg, nullptr), UCP_AM_SEND_FLAG_EAGER, req);
+        nixl::ucx::am_cb_op_t::NOTIF_STR, buildNotif(msg, nullptr), UCP_AM_SEND_FLAG_EAGER);
 }
 
 ucx_connection_ptr_t
