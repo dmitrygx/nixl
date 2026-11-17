@@ -18,12 +18,20 @@
 #ifndef NIXL_SRC_PLUGINS_UCX_AM_SEND_H
 #define NIXL_SRC_PLUGINS_UCX_AM_SEND_H
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+
+extern "C" {
+#include <ucp/api/ucp.h>
+}
 
 namespace nixl::ucx {
 
@@ -102,6 +110,75 @@ public:
 private:
     const std::string payload_;
     const std::optional<amPendingStats> pendingStats_;
+};
+
+// Saturate before converting milliseconds to the steady clock's duration:
+// a valid milliseconds::rep can overflow that conversion or time-point addition.
+[[nodiscard]] inline std::chrono::steady_clock::time_point
+amDrainDeadline(std::chrono::milliseconds timeout) noexcept {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    if (timeout <= std::chrono::milliseconds::zero()) {
+        return now;
+    }
+    const auto max_timeout =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::duration::max());
+    if (timeout >= max_timeout) {
+        return clock::time_point::max();
+    }
+    const auto delta = std::chrono::duration_cast<clock::duration>(timeout);
+    return (now >= clock::time_point::max() - delta) ? clock::time_point::max() : now + delta;
+}
+
+// How long a worker and its endpoints wait for their pending AM sends at
+// teardown. Teardown can also give all of them one deadline.
+class amDrain {
+public:
+    amDrain(ucp_worker_h worker, std::chrono::milliseconds timeout)
+        : worker_(worker),
+          timeout_(timeout) {
+        if (timeout.count() < 0) {
+            throw std::invalid_argument("UCX notification drain timeout must be nonnegative");
+        }
+    }
+
+    [[nodiscard]] std::chrono::milliseconds
+    timeout() const noexcept {
+        return timeout_;
+    }
+
+    // Wait until the target has no pending sends or the deadline passes. With
+    // progress, progress the worker meanwhile.
+    [[nodiscard]] bool
+    wait(const amSendStats &target,
+         std::chrono::steady_clock::time_point deadline,
+         bool progress) const {
+        deadline = std::min(deadline, shutdownDeadline_);
+        while (target.pending() != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            // progressLoop() can run indefinitely under sustained activity.
+            // Check the deadline between individual UCX progress calls instead.
+            if (!progress || (ucp_worker_progress(worker_) == 0)) {
+                std::this_thread::yield();
+            }
+        }
+        return true;
+    }
+
+    // Once progress threads have stopped: one teardown budget for the worker
+    // and all its endpoints
+    void
+    beginShutdown(std::chrono::steady_clock::time_point deadline) noexcept {
+        shutdownDeadline_ = std::min(shutdownDeadline_, deadline);
+    }
+
+private:
+    const ucp_worker_h worker_;
+    const std::chrono::milliseconds timeout_;
+    std::chrono::steady_clock::time_point shutdownDeadline_ =
+        std::chrono::steady_clock::time_point::max();
 };
 
 } // namespace nixl::ucx

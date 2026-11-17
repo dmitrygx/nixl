@@ -18,6 +18,7 @@
 #define NIXL_SRC_UTILS_UCX_UCX_UTILS_H
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string_view>
 #include <type_traits>
@@ -43,6 +44,9 @@ enum class nixl_ucx_vram_memtype_hint_t {
 
 inline constexpr std::string_view nixl_ucx_err_handling_param_name = "ucx_error_handling_mode";
 inline constexpr std::string_view nixl_ucx_vram_memtype_hint_param_name = "ucx_vram_memtype_hint";
+inline constexpr std::string_view nixl_ucx_notif_drain_timeout_param_name =
+    "ucx_notif_drain_timeout_ms";
+inline constexpr std::chrono::milliseconds nixl_ucx_notif_drain_timeout{1000};
 
 // The API `ucp_context_query(ctx, &attr)` sets `UCS_MEMORY_TYPE_RDMA` in `attr.memory_types`
 // field only from UCX 1.22
@@ -58,6 +62,9 @@ private:
     const std::shared_ptr<nixl::ucx::amSendStats> epAmStats_ =
         std::make_shared<nixl::ucx::amSendStats>();
     const std::shared_ptr<nixl::ucx::amSendStats> workerAmStats_;
+    const nixl::ucx::amDrain &amDrain_;
+    std::chrono::steady_clock::time_point amShutdownDeadline_ =
+        std::chrono::steady_clock::time_point::max();
     ucp_ep_h eph_{nullptr};
     std::atomic<nixl::ucx::ep_state_t> state_{nixl::ucx::ep_state_t::CONNECTED};
     const uint32_t closeFlags_;
@@ -80,7 +87,8 @@ public:
     nixlUcxEp(ucp_worker_h worker,
               void *addr,
               ucp_err_handling_mode_t err_handling_mode,
-              std::shared_ptr<nixl::ucx::amSendStats> worker_am_stats);
+              std::shared_ptr<nixl::ucx::amSendStats> worker_am_stats,
+              const nixl::ucx::amDrain &am_drain);
     ~nixlUcxEp();
     nixlUcxEp(const nixlUcxEp &) = delete;
     nixlUcxEp &
@@ -107,6 +115,16 @@ public:
     getPendingAmSends() const noexcept {
         return epAmStats_->pending();
     }
+
+    // Best effort: local completion releases payloads, not a delivery guarantee.
+    // The caller must obey the worker's normal threading/progress requirements.
+    // Without progress, only wait for the thread that progresses the worker.
+    [[nodiscard]] bool
+    drainAmSends(std::chrono::milliseconds timeout, bool progress = true) const;
+
+    // Share one teardown budget across all endpoints in a connection.
+    void
+    beginAmShutdown(std::chrono::steady_clock::time_point deadline) noexcept;
 
     /* Data access */
     [[nodiscard]] nixl_status_t
@@ -249,9 +267,11 @@ public:
     explicit nixlUcxWorker(
         const nixlUcxContext &,
         ucp_err_handling_mode_t ucp_err_handling_mode = UCP_ERR_HANDLING_MODE_NONE,
-        size_t id = 0);
+        size_t id = 0,
+        std::chrono::milliseconds am_drain_timeout = nixl_ucx_notif_drain_timeout);
 
-    virtual ~nixlUcxWorker() = default;
+    // Waits up to the drain timeout for the pending AM sends
+    virtual ~nixlUcxWorker();
 
     nixlUcxWorker(nixlUcxWorker &&) = delete;
     nixlUcxWorker(const nixlUcxWorker &) = delete;
@@ -279,6 +299,12 @@ public:
     getPendingAmSends() const noexcept {
         return amStats_->pending();
     }
+
+    [[nodiscard]] bool
+    drainAmSends(std::chrono::milliseconds timeout) const;
+    // Share one teardown budget across all workers in an engine.
+    void
+    beginAmShutdown(std::chrono::steady_clock::time_point deadline) noexcept;
 
     /* Data access */
     unsigned
@@ -336,6 +362,7 @@ private:
     const std::shared_ptr<nixl::ucx::amSendStats> amStats_ =
         std::make_shared<nixl::ucx::amSendStats>();
     const std::unique_ptr<ucp_worker, void (*)(ucp_worker *)> worker;
+    nixl::ucx::amDrain amDrain_;
     const ucp_err_handling_mode_t err_handling_mode_;
     const size_t id_;
     const bool progressThread_;

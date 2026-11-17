@@ -60,6 +60,18 @@ errHandlingModeFromParams(const nixl_b_params_t *custom_params) {
         custom_params, std::string(nixl_ucx_err_handling_param_name));
     return opt ? ucx_err_mode_from_string(*opt) : UCP_ERR_HANDLING_MODE_PEER;
 }
+
+[[nodiscard]] std::chrono::milliseconds
+notifDrainTimeoutFromParams(const nixl_b_params_t *custom_params) {
+    const auto timeout =
+        nixl::getBackendParamDefaulted(custom_params,
+                                       std::string(nixl_ucx_notif_drain_timeout_param_name),
+                                       nixl_ucx_notif_drain_timeout.count());
+    if (timeout < 0) {
+        throw std::invalid_argument("UCX notification drain timeout must be nonnegative");
+    }
+    return std::chrono::milliseconds(timeout);
+}
 } // namespace
 
 /****************************************
@@ -99,6 +111,7 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params, size_t nu
                             nixl_backend_capability_t::NOTIF |
                             nixl_backend_capability_t::TRACE_CONTEXT),
       errHandlingMode_(errHandlingModeFromParams(init_params.customParams)),
+      notifDrainTimeout_(notifDrainTimeoutFromParams(init_params.customParams)),
       sharedWorkerIndex_(1),
       sglEnabled_(sglEnabledFromConfig()),
       traceSink_(init_params.traceSink) {
@@ -164,6 +177,13 @@ tlsSharedWorkerMap() {
 // Through parent destructor the unregister will be called.
 nixlUcxEngine::~nixlUcxEngine() {
     tlsSharedWorkerMap().erase(this);
+    // The endpoints, and then the workers, wait for their outstanding AM sends
+    // when they are destroyed. Give them all one deadline rather than a full
+    // timeout each.
+    const auto deadline = nixl::ucx::amDrainDeadline(notifDrainTimeout_);
+    for (const auto &worker : workers_) {
+        worker->beginAmShutdown(deadline);
+    }
 }
 
 /****************************************
@@ -189,6 +209,26 @@ nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
 
     if (it == remoteConnMap.end()) {
         return NIXL_ERR_NOT_FOUND;
+    }
+
+    const auto deadline = nixl::ucx::amDrainDeadline(notifDrainTimeout_);
+    for (const auto &ep : it->second->eps) {
+        ep->beginAmShutdown(deadline);
+    }
+    // A request handle can still hold this connection after map removal, so
+    // drain here rather than relying only on endpoint destruction. Sends that
+    // remain after a timeout stay until the endpoints close: below, or when
+    // the last request handle that holds the connection is released.
+    // ucp_request_cancel() does not cancel sends, and closing the endpoints of
+    // a live handle here would abort its transfers.
+    const auto &eps = it->second->eps;
+    for (size_t i = 0; i < eps.size(); ++i) {
+        // Dedicated workers are progressed by their own threads
+        const bool progress = (i < numSharedWorkers_);
+        if (!eps[i]->drainAmSends(notifDrainTimeout_, progress)) {
+            NIXL_WARN << "UCX AM drain timed out with " << eps[i]->getPendingAmSends()
+                      << " pending sends on ep " << eps[i]->getEp();
+        }
     }
 
     // thread safety?

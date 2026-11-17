@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -91,9 +92,10 @@ protected:
 
     // Replace the sender worker and its endpoint
     void
-    reconnect(ucp_err_handling_mode_t mode) {
+    reconnect(ucp_err_handling_mode_t mode,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
         ep_.reset();
-        sender_ = std::make_unique<nixlUcxWorker>(*context_, mode);
+        sender_ = std::make_unique<nixlUcxWorker>(*context_, mode, 0, timeout);
         auto address = receiver_->epAddr();
         ep_ = sender_->connect(address.data());
         ASSERT_NE(nullptr, ep_);
@@ -107,8 +109,9 @@ protected:
 
     // Reconnect and exchange a message, then leave the receiver idle
     void
-    establish(ucp_err_handling_mode_t mode) {
-        ASSERT_NO_FATAL_FAILURE(reconnect(mode));
+    establish(ucp_err_handling_mode_t mode,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
+        ASSERT_NO_FATAL_FAILURE(reconnect(mode, timeout));
         const nixl_status_t status = send("ready");
         ASSERT_TRUE(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
         ASSERT_TRUE(waitUntil([&] {
@@ -159,7 +162,8 @@ protected:
     // counters must drop to zero, as the payloads must be released (LeakSanitizer).
     void
     destroyPending(ucp_err_handling_mode_t mode) {
-        ASSERT_NO_FATAL_FAILURE(reconnect(mode));
+        const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
+        ASSERT_NO_FATAL_FAILURE(reconnect(mode, std::chrono::milliseconds(0)));
         const auto worker_stats = sender_->getAmSendStats();
         const auto ep_stats = ep_->getAmSendStats();
         ASSERT_EQ(NIXL_IN_PROG, send(std::string(large_payload_size, 'n')));
@@ -169,6 +173,33 @@ protected:
         sender_.reset();
         EXPECT_EQ(0, worker_stats->pending());
         EXPECT_EQ(0, ep_stats->pending());
+    }
+
+    // Destroy the endpoint while another thread progresses the receiver:
+    // the endpoint destructor must drain the send, so that it is delivered.
+    void
+    drainWithCooperatingReceiver() {
+        const std::string payload(large_payload_size, 'n');
+        const auto ep_stats = ep_->getAmSendStats();
+        ASSERT_EQ(NIXL_IN_PROG, send(payload));
+        ASSERT_EQ(1, ep_stats->pending());
+        std::atomic<bool> delivered{false};
+        std::jthread receiver_progress([&](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                receiver_->progress();
+                if (received_.size() == payload.size()) {
+                    delivered = true;
+                    return;
+                }
+            }
+        });
+        ep_.reset();
+        EXPECT_EQ(0, ep_stats->pending());
+        EXPECT_TRUE(waitUntil([&] { return delivered.load(); }));
+        receiver_progress.request_stop();
+        receiver_progress.join();
+        EXPECT_TRUE(payload == received_)
+            << "expected bytes=" << payload.size() << ", received bytes=" << received_.size();
     }
 
     gtest::ScopedEnv env_;
@@ -224,20 +255,37 @@ TEST_F(ucxNotification, FailedEndpointRejectsNotification) {
     EXPECT_EQ(0, ep_->getPendingAmSends());
 }
 
-TEST_F(ucxNotification, ProgressNotificationAfterEndpointDestroyed) {
-    // A graceful close leaves the pending send to its worker, which still
-    // delivers it and releases its payload.
-    ASSERT_NO_FATAL_FAILURE(reconnect(UCP_ERR_HANDLING_MODE_NONE));
-    const std::string payload(large_payload_size, 'n');
+TEST_F(ucxNotification, EndpointDestructionDrainsNotification) {
+    drainWithCooperatingReceiver();
+}
+
+TEST_F(ucxNotification, DrainTimeoutIsBounded) {
+    const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
+    ASSERT_NO_FATAL_FAILURE(reconnect(UCP_ERR_HANDLING_MODE_PEER, std::chrono::milliseconds(5)));
+    ASSERT_EQ(NIXL_IN_PROG, send(std::string(large_payload_size, 'n')));
+    EXPECT_FALSE(ep_->drainAmSends(std::chrono::milliseconds(0)));
+    const auto worker_stats = sender_->getAmSendStats();
     const auto ep_stats = ep_->getAmSendStats();
+    const auto start = std::chrono::steady_clock::now();
+    ep_.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+    sender_.reset();
+    EXPECT_EQ(0, worker_stats->pending());
+    EXPECT_EQ(0, ep_stats->pending());
+}
+
+TEST_F(ucxNotification, ProgressNotificationAfterEndpointDestroyed) {
+    // No drain budget: a graceful close still delivers the pending send while
+    // its worker keeps progressing.
+    const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
+    ASSERT_NO_FATAL_FAILURE(reconnect(UCP_ERR_HANDLING_MODE_NONE, std::chrono::milliseconds(0)));
+    const std::string payload(large_payload_size, 'n');
     ASSERT_EQ(NIXL_IN_PROG, send(payload));
     ep_.reset();
     ASSERT_NO_FATAL_FAILURE(progressUntilReceived(payload));
-    EXPECT_TRUE(waitUntil([&] {
-        sender_->progress();
-        return sender_->getPendingAmSends() == 0;
-    }));
-    EXPECT_EQ(0, ep_stats->pending());
+    EXPECT_TRUE(sender_->drainAmSends(std::chrono::milliseconds(1000)));
+    EXPECT_EQ(0, sender_->getPendingAmSends());
+    EXPECT_EQ(1, timeout.getIgnoredCount());
 }
 
 TEST_F(ucxNotification, DestroyWorkerWithPendingNotificationPeer) {
@@ -246,6 +294,51 @@ TEST_F(ucxNotification, DestroyWorkerWithPendingNotificationPeer) {
 
 TEST_F(ucxNotification, DestroyWorkerWithPendingNotificationNone) {
     destroyPending(UCP_ERR_HANDLING_MODE_NONE);
+}
+
+TEST_F(ucxNotification, MaximumTimeoutOnEmptyWorkerDoesNotOverflow) {
+    ASSERT_NO_FATAL_FAILURE(
+        reconnect(UCP_ERR_HANDLING_MODE_PEER, std::chrono::milliseconds::max()));
+    EXPECT_EQ(0, sender_->getPendingAmSends());
+    EXPECT_TRUE(sender_->drainAmSends(std::chrono::milliseconds::max()));
+    EXPECT_TRUE(ep_->drainAmSends(std::chrono::milliseconds::max()));
+}
+
+TEST_F(ucxNotification, OneShutdownDeadlineCapsMultipleWorkers) {
+    const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
+    std::array<std::unique_ptr<nixlUcxWorker>, 3> workers;
+    std::array<std::unique_ptr<nixlUcxEp>, 3> endpoints;
+    std::array<std::shared_ptr<const nixl::ucx::amSendStats>, 3> stats;
+    auto address = receiver_->epAddr();
+    for (size_t i = 0; i < workers.size(); ++i) {
+        workers[i] = std::make_unique<nixlUcxWorker>(
+            *context_, UCP_ERR_HANDLING_MODE_PEER, 0, std::chrono::milliseconds(1000));
+        endpoints[i] = workers[i]->connect(address.data());
+        ASSERT_NE(nullptr, endpoints[i]);
+        stats[i] = workers[i]->getAmSendStats();
+        ASSERT_EQ(NIXL_IN_PROG,
+                  endpoints[i]->sendAm(nixl::ucx::am_cb_op_t::NOTIF_STR,
+                                       std::string(large_payload_size, 'n'),
+                                       UCP_AM_SEND_FLAG_EAGER));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+    for (const auto &worker : workers) {
+        worker->beginAmShutdown(deadline);
+    }
+    EXPECT_FALSE(workers[0]->drainAmSends(std::chrono::milliseconds(1000)));
+    // The first worker used up the shared budget. No later worker or endpoint
+    // may start another full timeout, even when given a later deadline.
+    const auto tail_start = std::chrono::steady_clock::now();
+    for (size_t i = 1; i < workers.size(); ++i) {
+        workers[i]->beginAmShutdown(tail_start + std::chrono::seconds(5));
+        EXPECT_FALSE(workers[i]->drainAmSends(std::chrono::milliseconds(1000)));
+    }
+    endpoints = {};
+    workers = {};
+    EXPECT_LT(std::chrono::steady_clock::now() - tail_start, std::chrono::milliseconds(500));
+    for (const auto &observer : stats) {
+        EXPECT_EQ(0, observer->pending());
+    }
 }
 
 // Established RC connections: the send is posted to the NIC, not only queued
@@ -277,6 +370,7 @@ protected:
     void
     destroyEstablished(ucp_err_handling_mode_t mode, bool progress_send) {
         ASSERT_NO_FATAL_FAILURE(establish(mode));
+        const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
         const auto worker_stats = sender_->getAmSendStats();
         const auto ep_stats = ep_->getAmSendStats();
         ASSERT_EQ(NIXL_IN_PROG, send(std::string(large_payload_size, 'n')));
@@ -294,12 +388,25 @@ protected:
     }
 };
 
+class ucxNotificationRcDelivery : public ucxNotificationRc {
+protected:
+    bool
+    limitReceiveQueue() const override {
+        return false;
+    }
+};
+
 TEST_F(ucxNotificationRc, EstablishedPendingPeerTeardown) {
     destroyEstablished(UCP_ERR_HANDLING_MODE_PEER, false);
 }
 
 TEST_F(ucxNotificationRc, EstablishedInflightPeerTeardown) {
     destroyEstablished(UCP_ERR_HANDLING_MODE_PEER, true);
+}
+
+TEST_F(ucxNotificationRcDelivery, EstablishedEndpointDrainsNotification) {
+    ASSERT_NO_FATAL_FAILURE(establish(UCP_ERR_HANDLING_MODE_PEER, std::chrono::milliseconds(5000)));
+    drainWithCooperatingReceiver();
 }
 
 // MULTI workers: sends, progress and endpoint teardown race
@@ -312,6 +419,10 @@ protected:
         }
         ASSERT_NO_FATAL_FAILURE(
             createWorkers("tcp", true, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW));
+        // A lifetime stress, not a timeout test: let the whole burst drain,
+        // also under sanitizers
+        ASSERT_NO_FATAL_FAILURE(
+            reconnect(UCP_ERR_HANDLING_MODE_PEER, std::chrono::milliseconds(5000)));
         ucp_worker_attr_t attributes{};
         attributes.field_mask = UCP_WORKER_ATTR_FIELD_THREAD_MODE;
         ASSERT_EQ(UCS_OK, ucp_worker_query(sender_->get(), &attributes));
@@ -388,11 +499,11 @@ TEST_F(ucxNotificationMt, ConcurrentSendProgressAndTeardown) {
     }
     EXPECT_GT(worker_stats->pending(), 0);
     receive_enabled = true;
+    // The senders are joined, but the progress thread still races the send
+    // callbacks against the endpoint drain and close.
+    ep_.reset();
     const bool delivered =
         waitUntil([&] { return received_bytes.load() == messages * payload_size; });
-    // The senders are joined, but the progress thread still races the last
-    // send callbacks against the endpoint close.
-    ep_.reset();
     sender_progress.request_stop();
     sender_progress.join();
     // Stop progressing the worker before destroying it
@@ -412,6 +523,52 @@ TEST_F(ucxNotificationMt, ConcurrentSendProgressAndTeardown) {
         EXPECT_FALSE(seen[id]);
         seen[id] = true;
         EXPECT_TRUE(gtest::checkPayload(received_.data() + offset, payload_size, id, seed));
+    }
+}
+
+TEST(ucxNotificationConfig, InvalidDrainTimeoutRejected) {
+    nixlBackendInitParams init;
+    init.localAgent = "notif-config";
+    init.type = "UCX";
+    init.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE;
+    nixl_b_params_t params;
+    init.customParams = &params;
+    params["ucx_notif_drain_timeout_ms"] = "-1";
+    EXPECT_THROW((void)nixlUcxEngine::create(init), std::invalid_argument);
+    for (const auto *value : {"invalid", "1.5", "999999999999999999999999999999"}) {
+        params = {{"ucx_notif_drain_timeout_ms", value}};
+        EXPECT_THROW((void)nixlUcxEngine::create(init), std::runtime_error);
+    }
+}
+
+TEST(ucxNotificationConfig, ZeroAndMaximumDrainTimeoutAreAccepted) {
+    gtest::ScopedEnv env;
+    env.addVar("UCX_TLS", gtest::ucxTls("tcp"));
+    const gtest::LogIgnoreGuard gpu_warning(
+        "GPU\\(s\\) were detected, but UCX (CUDA|ROCm) support was not found");
+    nixl_b_params_t params{{"ucx_notif_drain_timeout_ms", "0"}, {"engine_config", "TLS=tcp"}};
+    nixlBackendInitParams init;
+    init.localAgent = "notif-zero-config";
+    init.type = "UCX";
+    init.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE;
+    init.customParams = &params;
+    for (const auto timeout : {std::chrono::milliseconds(0), std::chrono::milliseconds::max()}) {
+        params["ucx_notif_drain_timeout_ms"] = std::to_string(timeout.count());
+        EXPECT_NO_THROW((void)nixlUcxEngine::create(init));
+    }
+}
+
+TEST(ucxNotificationConfig, DrainDeadlineSaturatesWithoutOverflow) {
+    using clock = std::chrono::steady_clock;
+    using milliseconds = std::chrono::milliseconds;
+    EXPECT_EQ(clock::time_point::max(), nixl::ucx::amDrainDeadline(milliseconds::max()));
+    for (const auto timeout : {milliseconds::min(), milliseconds(0), milliseconds(20)}) {
+        const auto before = clock::now();
+        const auto deadline = nixl::ucx::amDrainDeadline(timeout);
+        const auto after = clock::now();
+        const auto increment = std::max(timeout, milliseconds(0));
+        EXPECT_LE(before + increment, deadline);
+        EXPECT_LE(deadline, after + increment);
     }
 }
 

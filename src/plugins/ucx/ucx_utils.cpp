@@ -41,6 +41,8 @@ get_ucx_backend_common_options() {
                    ucx_err_mode_to_string(UCP_ERR_HANDLING_MODE_PEER));
     params.emplace(nixl_ucx_vram_memtype_hint_param_name,
                    ucx_vram_memtype_hint_to_string(nixl_ucx_vram_memtype_hint_t::AUTO));
+    params.emplace(nixl_ucx_notif_drain_timeout_param_name,
+                   std::to_string(nixl_ucx_notif_drain_timeout.count()));
     return params;
 }
 
@@ -159,6 +161,10 @@ ucpEpClose(ucp_ep_h ep, uint32_t flags) {
 
 nixl_status_t
 nixlUcxEp::disconnect() {
+    if (checkTxState() == NIXL_SUCCESS && !drainAmSends(amDrain_.timeout())) {
+        NIXL_WARN << "UCX AM drain timed out with " << getPendingAmSends()
+                  << " pending sends on ep " << eph_;
+    }
     const nixl::ucx::ep_state_t current_state = state_;
 
     switch (current_state) {
@@ -189,11 +195,24 @@ nixlUcxEp::disconnect() {
     std::terminate();
 }
 
+bool
+nixlUcxEp::drainAmSends(std::chrono::milliseconds timeout, bool progress) const {
+    return amDrain_.wait(
+        *epAmStats_, std::min(nixl::ucx::amDrainDeadline(timeout), amShutdownDeadline_), progress);
+}
+
+void
+nixlUcxEp::beginAmShutdown(std::chrono::steady_clock::time_point deadline) noexcept {
+    amShutdownDeadline_ = std::min(amShutdownDeadline_, deadline);
+}
+
 nixlUcxEp::nixlUcxEp(ucp_worker_h worker,
                      void *addr,
                      ucp_err_handling_mode_t err_handling_mode,
-                     std::shared_ptr<nixl::ucx::amSendStats> worker_am_stats)
+                     std::shared_ptr<nixl::ucx::amSendStats> worker_am_stats,
+                     const nixl::ucx::amDrain &am_drain)
     : workerAmStats_(std::move(worker_am_stats)),
+      amDrain_(am_drain),
       closeFlags_(err_handling_mode == UCP_ERR_HANDLING_MODE_PEER ? UCP_EP_CLOSE_FLAG_FORCE : 0) {
     ucp_ep_params_t ep_params;
 
@@ -746,13 +765,32 @@ operator<<(std::ostream &os, const nixlUcxWorker &worker) {
 
 nixlUcxWorker::nixlUcxWorker(const nixlUcxContext &ctx,
                              ucp_err_handling_mode_t err_handling_mode,
-                             size_t id)
+                             size_t id,
+                             std::chrono::milliseconds am_drain_timeout)
     : name_(ctx.getName() + ":" + std::to_string(id)),
       worker(createUcpWorker(ctx), &ucp_worker_destroy),
+      amDrain_(worker.get(), am_drain_timeout),
       err_handling_mode_(err_handling_mode),
       id_(id),
       progressThread_(ctx.hasProgressThread()) {
     NIXL_DEBUG << *this << ": created ucp worker " << worker.get();
+}
+
+nixlUcxWorker::~nixlUcxWorker() {
+    if (!drainAmSends(amDrain_.timeout())) {
+        NIXL_WARN << "UCX AM drain timed out with " << getPendingAmSends()
+                  << " pending sends on worker " << name_;
+    }
+}
+
+bool
+nixlUcxWorker::drainAmSends(std::chrono::milliseconds timeout) const {
+    return amDrain_.wait(*amStats_, nixl::ucx::amDrainDeadline(timeout), true);
+}
+
+void
+nixlUcxWorker::beginAmShutdown(std::chrono::steady_clock::time_point deadline) noexcept {
+    amDrain_.beginShutdown(deadline);
 }
 
 std::string
@@ -774,7 +812,8 @@ nixlUcxWorker::epAddr() {
 std::unique_ptr<nixlUcxEp>
 nixlUcxWorker::connect(void *addr) {
     try {
-        auto ep = std::make_unique<nixlUcxEp>(worker.get(), addr, err_handling_mode_, amStats_);
+        auto ep =
+            std::make_unique<nixlUcxEp>(worker.get(), addr, err_handling_mode_, amStats_, amDrain_);
         NIXL_DEBUG << *this << ": created ep " << ep->getEp();
         return ep;
     }
