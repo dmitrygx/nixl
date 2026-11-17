@@ -373,8 +373,9 @@ public:
     nixlUcxDedicatedWorker(const nixlUcxContext &context,
                            ucp_err_handling_mode_t err_handling_mode,
                            size_t id,
+                           std::chrono::milliseconds am_drain_timeout,
                            nixlUcxEngine *engine)
-        : nixlUcxWorker(context, err_handling_mode, id),
+        : nixlUcxWorker(context, err_handling_mode, id, am_drain_timeout),
           thread_(std::in_place, engine, *this) {}
 
     void
