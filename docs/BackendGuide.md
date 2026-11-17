@@ -104,6 +104,17 @@ Within each transfer request, a descriptor list is passed, if there is room for 
 
 Note that any transfer request will be prepped only once, but can be posted multiple times, as long as it gets to DONE state before getting reposted. There is no ordering guarantee across transfer requests, and no locking mechanism for any specific memory region; the user is in charge of not corrupting the memory by having two simultaneous transfers to the same location.
 
+For the UCX backend, a transfer with a notification reaches DONE (`NIXL_SUCCESS`)
+once its data, its flush and the send of its notification are complete, after
+all descriptors, including all chunks of a thread-pool transfer. With the
+progress thread enabled, it reaches DONE once its notification is posted to
+UCX instead: the progress thread, or the thread-pool thread that sent the
+notification, completes the send, and the application does not have to call
+anything for it. The handle can be released or reposted meanwhile. In that
+mode, an error in posting the notification fails the transfer; a later send
+error is only logged, and the endpoint reports its failure to subsequent
+operations.
+
 Finally, note that a call to releaseXferReq should not block and be asynchronous, especially important to remember when aborting a transfer. This function can return error, meaning it was not successful in aborting the request. If a backend can abort a transfer quickly without a stall, then releaseXferReq can return success right away. Otherwise, one option would be to wait for the transfer to complete. In the meantime, checkXferReq should return error if there was a call to abort which was not successful, while calls to releaseXferReq would return error until the transfer is completed and it returns success. If there is a scenario that a blocking call can abort the transfer before it is completed, then that blocking call can start in a separate thread (or within the progress thread of the backend). In other words, use a blocking call under the hood but provide non-blocking APIs to the user.
 ### Notification Handling:
 

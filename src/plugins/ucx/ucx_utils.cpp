@@ -540,6 +540,7 @@ nixlUcxContext::nixlUcxContext(const std::vector<std::string> &devs,
                                const std::string &name,
                                nixl_ucx_vram_memtype_hint_t vram_mem_type_hint_policy)
     : mtType_(makeMtType(prog_thread, sync_mode)),
+      progressThread_(prog_thread),
       ucpVersion_(makeUcpVersion()),
       name_(name),
       vramMemTypeHintPolicy_(vram_mem_type_hint_policy) {
@@ -749,7 +750,8 @@ nixlUcxWorker::nixlUcxWorker(const nixlUcxContext &ctx,
     : name_(ctx.getName() + ":" + std::to_string(id)),
       worker(createUcpWorker(ctx), &ucp_worker_destroy),
       err_handling_mode_(err_handling_mode),
-      id_(id) {
+      id_(id),
+      progressThread_(ctx.hasProgressThread()) {
     NIXL_DEBUG << *this << ": created ucp worker " << worker.get();
 }
 

@@ -182,6 +182,7 @@ private:
     /* Local UCX stuff */
     std::unique_ptr<ucp_context, void (*)(ucp_context_h)> ctx{nullptr, &ucp_cleanup};
     const nixl::ucx::mt_mode_t mtType_;
+    const bool progressThread_;
     const unsigned ucpVersion_;
     const std::string name_;
     const nixl_ucx_vram_memtype_hint_t vramMemTypeHintPolicy_;
@@ -215,6 +216,12 @@ public:
     [[nodiscard]] const std::string &
     getName() const noexcept {
         return name_;
+    }
+
+    // The engine progresses the workers of this context from its threads
+    [[nodiscard]] bool
+    hasProgressThread() const noexcept {
+        return progressThread_;
     }
 
     /* Memory management */
@@ -313,6 +320,13 @@ public:
         return name_;
     }
 
+    // A thread of the engine progresses this worker, so a transfer does not
+    // have to wait for the send of its notification
+    [[nodiscard]] bool
+    hasProgressThread() const noexcept {
+        return progressThread_;
+    }
+
 private:
     [[nodiscard]] ucp_worker *
     createUcpWorker(const nixlUcxContext &) const;
@@ -324,6 +338,7 @@ private:
     const std::unique_ptr<ucp_worker, void (*)(ucp_worker *)> worker;
     const ucp_err_handling_mode_t err_handling_mode_;
     const size_t id_;
+    const bool progressThread_;
 };
 
 std::ostream &

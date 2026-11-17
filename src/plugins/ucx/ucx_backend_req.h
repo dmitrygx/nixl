@@ -189,12 +189,23 @@ protected:
     void
     sendNotif() {
         NIXL_ASSERT(!notif_.empty());
+        // With a progress thread, the transfer is complete once its notification
+        // is posted: the thread completes the send, and the callback releases
+        // its request and payload. Otherwise the transfer keeps the request and
+        // is complete when the send is.
+        const bool wait = !worker_->hasProgressThread();
         nixlUcxReq req = nullptr;
-        const nixl_status_t status = getEp().sendAm(
-            nixl::ucx::am_cb_op_t::NOTIF_STR, std::move(notif_), UCP_AM_SEND_FLAG_EAGER, &req);
+        nixl_status_t status = getEp().sendAm(nixl::ucx::am_cb_op_t::NOTIF_STR,
+                                              std::move(notif_),
+                                              UCP_AM_SEND_FLAG_EAGER,
+                                              wait ? &req : nullptr);
         notif_.clear();
         if (status == NIXL_IN_PROG) {
-            notifReq_ = req;
+            if (wait) {
+                notifReq_ = req;
+            } else {
+                status = NIXL_SUCCESS;
+            }
         }
         notifStatus_ = status;
     }

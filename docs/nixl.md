@@ -132,6 +132,12 @@ for n iterations:
 
 ```
 
+### UCX notification completion
+
+With the UCX backend, a transfer with a notification is complete once its
+notification is sent. With the progress thread enabled, it is complete once
+its notification is posted, and the progress thread sends it.
+
 ## Adding/removing agents (dynamic scaling)
 Adding a new agent to a service involves creating the agent and exchanging its metadata with the existing agents in the service. To remove an agent or handle a failure, you can use one of the metadata invalidate APIs. This triggers disconnections for backends connected to the agent and purges the cached metadata values.
 
