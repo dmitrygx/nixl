@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stop_token>
@@ -240,6 +241,64 @@ protected:
         return result;
     }
 
+    // Run a cleanup step of the initiator while the target is paused. Resume
+    // the target only after the step has started: a step that waits for an
+    // outstanding notification returns only after the resume. Return whether
+    // the step returned after the resume.
+    [[nodiscard]] bool
+    cleanupWaitsForReceiver(const std::function<void()> &cleanup) {
+        std::atomic<bool> started{false};
+        std::atomic<bool> resumed{false};
+        std::jthread resumer([&] {
+            while (!started.load()) {
+                std::this_thread::yield();
+            }
+            // Let the step reach its wait for the outstanding sends
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            resumed = true;
+            resumeReceiver();
+        });
+        started = true;
+        cleanup();
+        return resumed.load();
+    }
+
+    // Generate a large notification while the target is paused, then
+    // disconnect or destroy the initiator without any further progress
+    // through its API. The paused target takes none of the notification, so
+    // it is still being sent when the cleanup starts. With keep_request, a
+    // completed transfer request still holds the connection at disconnect.
+    void
+    genNotifThenCleanup(bool destroy, bool keep_request = false) {
+        nixlXferReqH *request = nullptr;
+        size_t expected = 1;
+        if (keep_request) {
+            preparePayload(NIXL_WRITE, 19);
+            ASSERT_EQ(NIXL_SUCCESS, transfer(NIXL_WRITE, "transfer", request));
+            ASSERT_TRUE(waitUntil([&] { return receiptCount() == 1; }));
+            expected = 2;
+        }
+        const std::string notification(1024 * 1024, 'g');
+        pauseReceiver();
+        ASSERT_EQ(NIXL_SUCCESS, sender_->genNotif(receiverName, notification));
+        ASSERT_EQ(expected - 1, receiptCount());
+        EXPECT_TRUE(cleanupWaitsForReceiver([&] {
+            if (destroy) {
+                sender_.reset();
+            } else {
+                EXPECT_EQ(NIXL_SUCCESS, sender_->invalidateRemoteMD(receiverName));
+            }
+        })) << "The cleanup did not wait for the outstanding notification";
+        EXPECT_TRUE(waitUntil([&] { return receiptCount() == expected; }));
+        EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+        if (receiptCount() == expected) {
+            EXPECT_TRUE(notification == getReceipt(expected - 1));
+        }
+        if (request != nullptr) {
+            ASSERT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+        }
+    }
+
     // Buffers outlive the agents and their registered memory
     std::vector<std::unique_ptr<buffer>> local_, remote_;
     nixl_reg_dlist_t localReg_{DRAM_SEG}, remoteReg_{DRAM_SEG};
@@ -282,6 +341,20 @@ TEST_P(ucxNotificationAgent, RepeatedReadWriteNotificationsAtDone) {
         }
     }
     EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+}
+
+TEST_P(ucxNotificationAgent, GenNotifThenDisconnectDeliversNotification) {
+    genNotifThenCleanup(false);
+}
+
+TEST_P(ucxNotificationAgent, GenNotifThenAgentDestructionDeliversNotification) {
+    genNotifThenCleanup(true);
+}
+
+TEST_P(ucxNotificationAgent, GenNotifThenDisconnectWithLiveHandleDeliversNotification) {
+    // A completed request keeps its backend connection. Disconnect must drain
+    // the connection before it drops it from its map.
+    genNotifThenCleanup(false, true);
 }
 
 INSTANTIATE_TEST_SUITE_P(ucx,
