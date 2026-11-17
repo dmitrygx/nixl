@@ -179,6 +179,31 @@ protected:
     std::unique_ptr<nixlUcxEp> ep_;
 };
 
+TEST_F(ucxNotification, TransferWaitsForNotificationSendWithoutProgressThread) {
+    ASSERT_NO_FATAL_FAILURE(establish(UCP_ERR_HANDLING_MODE_PEER));
+    const std::string payload(large_payload_size, 'n');
+    nixlUcxBackendReqH transfer(sender_.get());
+    transfer.setNotif(std::string(payload));
+    transfer.init({}, *ep_);
+    ASSERT_EQ(NIXL_SUCCESS, transfer.flush());
+
+    // Without a progress thread, the transfer is complete only when the send
+    // of its notification is. The receiver does not progress, so both stay
+    // pending.
+    for (size_t i = 0; i < 100; ++i) {
+        ASSERT_EQ(NIXL_IN_PROG, transfer.status());
+    }
+
+    nixl_status_t status = NIXL_IN_PROG;
+    EXPECT_TRUE(waitUntil([&] {
+        receiver_->progress();
+        return (status = transfer.status()) != NIXL_IN_PROG;
+    }));
+    EXPECT_EQ(NIXL_SUCCESS, status);
+    transfer.release();
+    ASSERT_NO_FATAL_FAILURE(progressUntilReceived(payload));
+}
+
 TEST_F(ucxNotification, CompletionClearsPendingCounters) {
     const std::string payload(large_payload_size, 'n');
     const auto worker_stats = sender_->getAmSendStats();
@@ -293,6 +318,30 @@ protected:
         ASSERT_EQ(UCS_THREAD_MODE_MULTI, attributes.thread_mode);
     }
 };
+
+TEST_F(ucxNotificationMt, TransferDoneWhileNotificationSendIsPending) {
+    ASSERT_NO_FATAL_FAILURE(establish(UCP_ERR_HANDLING_MODE_PEER));
+    // The context of this fixture is created for a progress thread, so the
+    // transfer does not wait for its notification send. The test progresses
+    // the workers itself.
+    const std::string payload(large_payload_size, 'n');
+    nixlUcxBackendReqH transfer(sender_.get());
+    transfer.setNotif(std::string(payload));
+    transfer.init({}, *ep_);
+    ASSERT_EQ(NIXL_SUCCESS, transfer.flush());
+
+    // There are no data requests, and the flush sends the notification. The
+    // receiver does not progress, so the notification send is still pending
+    // when the transfer completes.
+    nixl_status_t status = NIXL_IN_PROG;
+    EXPECT_TRUE(waitUntil([&] { return (status = transfer.status()) != NIXL_IN_PROG; }));
+    ASSERT_EQ(NIXL_SUCCESS, status);
+    EXPECT_EQ(1, ep_->getPendingAmSends());
+    transfer.release();
+
+    ASSERT_NO_FATAL_FAILURE(progressUntilReceived(payload));
+    ASSERT_NO_FATAL_FAILURE(progressUntilNoPendingSends());
+}
 
 TEST_F(ucxNotificationMt, ConcurrentSendProgressAndTeardown) {
     constexpr size_t producers = 4;

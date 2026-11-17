@@ -51,7 +51,7 @@ protected:
     SetUp() override {
         env_.addVar("NIXL_TELEMETRY_ENABLE", "n");
         env_.addVar("NIXL_UCX_SGL_ENABLE", "n");
-        env_.addVar("UCX_TLS", gtest::ucxTls("tcp"));
+        env_.addVar("UCX_TLS", gtest::ucxTls(transports_));
         env_.addVar("UCX_ZCOPY_THRESH", "0");
         // Small socket buffers: with the target paused, a large notification
         // fills them, and its send stays in flight until the target resumes.
@@ -72,7 +72,7 @@ protected:
         nixl_b_params_t params{{"num_workers", GetParam().composite ? "3" : "1"},
                                {"num_threads", GetParam().composite ? "2" : "0"},
                                {"split_batch_size", "2"},
-                               {"engine_config", "TLS=tcp,ZCOPY_THRESH=0"}};
+                               {"engine_config", "ZCOPY_THRESH=0"}};
         const gtest::LogIgnoreGuard gpu_warning(
             "GPU\\(s\\) were detected, but UCX (CUDA|ROCm) support was not found");
         nixlBackendH *backend = nullptr;
@@ -245,6 +245,8 @@ protected:
     nixl_reg_dlist_t localReg_{DRAM_SEG}, remoteReg_{DRAM_SEG};
     nixl_xfer_dlist_t localDescs_{DRAM_SEG}, remoteDescs_{DRAM_SEG};
     gtest::ScopedEnv env_;
+    // With TCP alone, the data of a transfer also need the target's progress
+    std::string transports_ = "tcp";
     std::unique_ptr<nixlAgent> sender_, receiver_;
     std::mutex receiverGateMutex_;
     std::condition_variable_any receiverGate_;
@@ -257,6 +259,148 @@ protected:
     static constexpr const char *senderName = "notif-agent-source";
     static constexpr const char *receiverName = "notif-agent-target";
 };
+
+// Shared memory: CMA carries the data of a transfer, and the flush of an
+// endpoint does not wait for the target, unlike over TCP. A transfer can then
+// complete while the target is paused, and a notification larger than the
+// FIFO of the posix transport is still being sent. Endpoints in peer error
+// mode need the error handling of the posix transport.
+class ucxNotificationAgentHeld : public ucxNotificationAgent {
+protected:
+    ucxNotificationAgentHeld() {
+        transports_ = "posix,cma";
+        env_.addVar("UCX_POSIX_ERROR_HANDLING", "y");
+        // 64 elements of up to 8 KiB take half of a 1 MiB notification
+        env_.addVar("UCX_POSIX_FIFO_SIZE", "64");
+    }
+
+    // Pause the target, then complete a transfer with a large notification.
+    // The paused target takes none of it, so the notification is still being
+    // sent when the transfer completes. The target stays paused.
+    void
+    transferWithHeldNotification(const std::string &notification,
+                                 uint32_t seed,
+                                 nixlXferReqH *&request) {
+        preparePayload(NIXL_WRITE, seed);
+        pauseReceiver();
+        ASSERT_EQ(NIXL_SUCCESS, transfer(NIXL_WRITE, notification, request))
+            << "The transfer did not complete while the target was paused; is CMA available?";
+        ASSERT_TRUE(payloadMatches(NIXL_WRITE, seed));
+        ASSERT_EQ(0u, receiptCount());
+    }
+};
+
+TEST_P(ucxNotificationAgentHeld, NotificationArrivesWithoutInitiatorCalls) {
+    // After the transfer completes, the threads of the initiator have to
+    // finish sending its notification: the progress thread or the thread that
+    // sent the notification of a split transfer.
+    if (!GetParam().progressThread) {
+        GTEST_SKIP() << "Without a progress thread, the transfer waits for its notification";
+    }
+    const std::string notification(1024 * 1024, 'n');
+    nixlXferReqH *request = nullptr;
+    ASSERT_NO_FATAL_FAILURE(transferWithHeldNotification(notification, 23, request));
+    ASSERT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+    resumeReceiver();
+    // Many times what the initiator's threads need when they progress it
+    // without pause; far less than with a progress call per second.
+    EXPECT_TRUE(waitUntil([&] { return receiptCount() == 1; }, std::chrono::seconds(3)));
+    if (receiptCount() == 1) {
+        EXPECT_TRUE(notification == getReceipt(0));
+    }
+    EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+}
+
+TEST_P(ucxNotificationAgent, ReleaseWhileFlushCallbackMayBePending) {
+    const gtest::LogIgnoreGuard canceled_requests(
+        "request handle .* released with .* requests in progress");
+    const gtest::LogIgnoreGuard release_retry(
+        "could not release transfer request and returned error status");
+    nixl_opt_args_t options;
+    options.notif = "released-transfer";
+    // Keep the registered buffers and their source bytes unchanged until all
+    // aborted operations have drained; only the request ownership races
+    // with progress.
+    preparePayload(NIXL_WRITE, 31);
+    for (size_t iteration = 0; iteration < 100; ++iteration) {
+        nixlXferReqH *request = nullptr;
+        ASSERT_EQ(NIXL_SUCCESS,
+                  sender_->createXferReq(
+                      NIXL_WRITE, localDescs_, remoteDescs_, receiverName, request, &options));
+        const auto posted = sender_->postXferReq(request);
+        ASSERT_TRUE(posted == NIXL_SUCCESS || posted == NIXL_IN_PROG);
+        const auto deadline = clock::now() + std::chrono::seconds(10);
+        do {
+            const auto released = sender_->releaseXferReq(request);
+            if (released == NIXL_SUCCESS) {
+                request = nullptr;
+                break;
+            }
+            ASSERT_EQ(NIXL_ERR_REPOST_ACTIVE, released);
+            const auto status = sender_->getXferStatus(request);
+            ASSERT_TRUE(status == NIXL_SUCCESS || status == NIXL_IN_PROG ||
+                        status == NIXL_ERR_CANCELED);
+            std::this_thread::yield();
+        } while (clock::now() < deadline);
+        ASSERT_EQ(nullptr, request) << "active transfer could not be released before the deadline";
+    }
+    // A completed transfer afterwards shows that the releases neither
+    // corrupted the callback state nor broke the connection. Released
+    // transfers may or may not have sent their notifications.
+    const std::string barrier = "after-released-transfers";
+    nixlXferReqH *request = nullptr;
+    ASSERT_EQ(NIXL_SUCCESS, transfer(NIXL_WRITE, barrier, request));
+    ASSERT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+    ASSERT_TRUE(waitUntil([&] {
+        nixl_notifs_t unused;
+        EXPECT_EQ(NIXL_SUCCESS, sender_->getNotifs(unused));
+        const size_t count = receiptCount();
+        for (size_t i = 0; i < count; ++i) {
+            if (getReceipt(i) == barrier) {
+                return true;
+            }
+        }
+        return false;
+    }));
+    EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+}
+
+TEST_P(ucxNotificationAgentHeld, TransferWaitsForNotificationWithoutProgressThread) {
+    if (GetParam().progressThread) {
+        GTEST_SKIP() << "With a progress thread, the transfer does not wait for its notification";
+    }
+    const std::string notification(1024 * 1024, 'w');
+    preparePayload(NIXL_WRITE, 29);
+    pauseReceiver();
+    nixl_opt_args_t options;
+    options.notif = notification;
+    nixlXferReqH *request = nullptr;
+    ASSERT_EQ(NIXL_SUCCESS,
+              sender_->createXferReq(
+                  NIXL_WRITE, localDescs_, remoteDescs_, receiverName, request, &options));
+    nixl_status_t status = sender_->postXferReq(request);
+
+    // The paused target holds back the notification. Without a progress
+    // thread, the transfer is complete only when its notification is sent,
+    // so it stays in progress until the target resumes.
+    const auto hold_until = clock::now() + std::chrono::milliseconds(300);
+    while ((status == NIXL_IN_PROG) && (clock::now() < hold_until)) {
+        status = sender_->getXferStatus(request);
+    }
+    EXPECT_EQ(NIXL_IN_PROG, status);
+
+    resumeReceiver();
+    EXPECT_TRUE(
+        waitUntil([&] { return (status = sender_->getXferStatus(request)) != NIXL_IN_PROG; }));
+    EXPECT_EQ(NIXL_SUCCESS, status);
+    EXPECT_TRUE(payloadMatches(NIXL_WRITE, 29));
+    EXPECT_TRUE(waitUntil([&] { return receiptCount() == 1; }));
+    if (receiptCount() == 1) {
+        EXPECT_TRUE(notification == getReceipt(0));
+    }
+    EXPECT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+    EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+}
 
 TEST_P(ucxNotificationAgent, RepeatedReadWriteNotificationsAtDone) {
     size_t expected = 0;
@@ -286,6 +430,17 @@ TEST_P(ucxNotificationAgent, RepeatedReadWriteNotificationsAtDone) {
 
 INSTANTIATE_TEST_SUITE_P(ucx,
                          ucxNotificationAgent,
+                         ::testing::Values(agentNotifParam{false, false},
+                                           agentNotifParam{false, true},
+                                           agentNotifParam{true, false},
+                                           agentNotifParam{true, true}),
+                         [](const ::testing::TestParamInfo<agentNotifParam> &info) {
+                             return std::string(info.param.composite ? "Composite" : "Base") +
+                                 (info.param.progressThread ? "ProgressThread" : "Polling");
+                         });
+
+INSTANTIATE_TEST_SUITE_P(ucx,
+                         ucxNotificationAgentHeld,
                          ::testing::Values(agentNotifParam{false, false},
                                            agentNotifParam{false, true},
                                            agentNotifParam{true, false},
