@@ -347,6 +347,39 @@ protected:
         ASSERT_TRUE(payloadMatches(NIXL_WRITE, seed));
         ASSERT_EQ(0u, receiptCount());
     }
+
+    // Complete a transfer while the target holds back its large notification,
+    // then disconnect or destroy the initiator without any further progress
+    // through its API. The cleanup has to wait for the notification.
+    void
+    doneThenCleanup(bool destroy, bool release_before_disconnect = true) {
+        if (!GetParam().progressThread) {
+            GTEST_SKIP() << "Without a progress thread, the transfer waits for its "
+                            "notification";
+        }
+        const std::string notification(1024 * 1024, 'n');
+        nixlXferReqH *request = nullptr;
+        ASSERT_NO_FATAL_FAILURE(transferWithHeldNotification(notification, 17, request));
+        if (destroy || release_before_disconnect) {
+            ASSERT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+            request = nullptr;
+        }
+        EXPECT_TRUE(cleanupWaitsForReceiver([&] {
+            if (destroy) {
+                sender_.reset();
+            } else {
+                EXPECT_EQ(NIXL_SUCCESS, sender_->invalidateRemoteMD(receiverName));
+            }
+        })) << "The cleanup did not wait for the outstanding notification";
+        EXPECT_TRUE(waitUntil([&] { return receiptCount() == 1; }));
+        EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+        if (receiptCount() == 1) {
+            EXPECT_TRUE(notification == getReceipt(0));
+        }
+        if (request != nullptr) {
+            ASSERT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+        }
+    }
 };
 
 TEST_P(ucxNotificationAgentHeld, NotificationArrivesWithoutInitiatorCalls) {
@@ -368,6 +401,20 @@ TEST_P(ucxNotificationAgentHeld, NotificationArrivesWithoutInitiatorCalls) {
         EXPECT_TRUE(notification == getReceipt(0));
     }
     EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+}
+
+TEST_P(ucxNotificationAgentHeld, DoneThenDisconnectDeliversNotification) {
+    doneThenCleanup(false);
+}
+
+TEST_P(ucxNotificationAgentHeld, DoneThenAgentDestructionDeliversNotification) {
+    doneThenCleanup(true);
+}
+
+TEST_P(ucxNotificationAgentHeld, DoneThenDisconnectWithLiveHandleDeliversNotification) {
+    // A completed request keeps its backend connection. Disconnect must drain
+    // the connection before it drops it from its map.
+    doneThenCleanup(false, false);
 }
 
 TEST_P(ucxNotificationAgent, ReleaseWhileFlushCallbackMayBePending) {

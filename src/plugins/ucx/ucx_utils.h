@@ -299,7 +299,6 @@ public:
     getPendingAmSends() const noexcept {
         return amStats_->pending();
     }
-
     [[nodiscard]] bool
     drainAmSends(std::chrono::milliseconds timeout) const;
     // Share one teardown budget across all workers in an engine.
