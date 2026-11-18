@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stop_token>
@@ -37,6 +38,12 @@ struct agentNotifParam {
     bool progressThread;
 };
 
+std::string
+agentNotifParamName(const ::testing::TestParamInfo<agentNotifParam> &info) {
+    return std::string(info.param.composite ? "Composite" : "Base") +
+        (info.param.progressThread ? "ProgressThread" : "Polling");
+}
+
 // Notifications through the public agent API, on the default and the
 // thread-pool (composite request) engine, with and without a progress thread
 // on the initiator.
@@ -46,6 +53,12 @@ protected:
     static constexpr size_t descriptorCount = 8;
     static constexpr size_t descriptorBytes = 64;
     using buffer = std::array<unsigned char, descriptorBytes>;
+
+    // Backend parameters of both agents
+    virtual nixl_b_params_t
+    backendParams(nixl_b_params_t params) const {
+        return params;
+    }
 
     void
     SetUp() override {
@@ -76,9 +89,9 @@ protected:
         const gtest::LogIgnoreGuard gpu_warning(
             "GPU\\(s\\) were detected, but UCX (CUDA|ROCm) support was not found");
         nixlBackendH *backend = nullptr;
-        ASSERT_EQ(NIXL_SUCCESS, sender_->createBackend("UCX", params, backend));
+        ASSERT_EQ(NIXL_SUCCESS, sender_->createBackend("UCX", backendParams(params), backend));
         ASSERT_NE(nullptr, backend);
-        ASSERT_EQ(NIXL_SUCCESS, receiver_->createBackend("UCX", params, backend));
+        ASSERT_EQ(NIXL_SUCCESS, receiver_->createBackend("UCX", backendParams(params), backend));
         ASSERT_NE(nullptr, backend);
 
         for (size_t i = 0; i < descriptorCount; ++i) {
@@ -240,6 +253,68 @@ protected:
         return result;
     }
 
+    // Run a cleanup step of the initiator while the target is paused. Resume
+    // the target only after the step has started: a step that waits for an
+    // outstanding notification returns only after the resume. Return whether
+    // the step returned after the resume.
+    [[nodiscard]] bool
+    cleanupWaitsForReceiver(const std::function<void()> &cleanup) {
+        std::atomic<bool> started{false};
+        std::atomic<bool> resumed{false};
+        std::jthread resumer([&] {
+            while (!started.load()) {
+                std::this_thread::yield();
+            }
+            // Let the step reach its wait for the outstanding sends
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            resumed = true;
+            resumeReceiver();
+        });
+        started = true;
+        cleanup();
+        return resumed.load();
+    }
+
+    // Disconnect the initiator from the target
+    void
+    invalidateReceiver() {
+        EXPECT_EQ(NIXL_SUCCESS, sender_->invalidateRemoteMD(receiverName));
+    }
+
+    // Generate a large notification while the target is paused, then run a
+    // cleanup step that disconnects the initiator, without any further
+    // progress through its API. The paused target takes none of the
+    // notification, so it is still being sent when the cleanup starts. With
+    // keep_request, a completed transfer request still holds the connection
+    // during the cleanup, and is released right after it.
+    void
+    genNotifThenCleanup(const std::function<void()> &cleanup, bool keep_request = false) {
+        nixlXferReqH *request = nullptr;
+        size_t expected = 1;
+        if (keep_request) {
+            preparePayload(NIXL_WRITE, 19);
+            ASSERT_EQ(NIXL_SUCCESS, transfer(NIXL_WRITE, "transfer", request));
+            ASSERT_TRUE(waitUntil([&] { return receiptCount() == 1; }));
+            expected = 2;
+        }
+        const std::string notification(1024 * 1024, 'g');
+        pauseReceiver();
+        ASSERT_EQ(NIXL_SUCCESS, sender_->genNotif(receiverName, notification));
+        ASSERT_EQ(expected - 1, receiptCount());
+        EXPECT_TRUE(cleanupWaitsForReceiver(cleanup))
+            << "The cleanup did not wait for the outstanding notification";
+        // Releasing the request closes the connection at once, which must not
+        // lose the notification either
+        if (request != nullptr) {
+            ASSERT_EQ(NIXL_SUCCESS, sender_->releaseXferReq(request));
+        }
+        EXPECT_TRUE(waitUntil([&] { return receiptCount() == expected; }));
+        EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
+        if (receiptCount() == expected) {
+            EXPECT_TRUE(notification == getReceipt(expected - 1));
+        }
+    }
+
     // Buffers outlive the agents and their registered memory
     std::vector<std::unique_ptr<buffer>> local_, remote_;
     nixl_reg_dlist_t localReg_{DRAM_SEG}, remoteReg_{DRAM_SEG};
@@ -284,15 +359,50 @@ TEST_P(ucxNotificationAgent, RepeatedReadWriteNotificationsAtDone) {
     EXPECT_EQ(NIXL_SUCCESS, receiverStatus_.load());
 }
 
+TEST_P(ucxNotificationAgent, GenNotifThenDisconnectDeliversNotification) {
+    genNotifThenCleanup([this] { invalidateReceiver(); });
+}
+
+TEST_P(ucxNotificationAgent, GenNotifThenDisconnectWithLiveHandleDeliversNotification) {
+    // A completed request keeps its backend connection. Disconnect must drain
+    // the connection before it drops it from its map.
+    genNotifThenCleanup([this] { invalidateReceiver(); }, true);
+}
+
+// Both agents close their endpoints gracefully, as UCX needs the same error
+// handling mode on both sides. The sends in flight on an endpoint that closes
+// stay with its worker, which cancels them when it is destroyed.
+class ucxNotificationAgentGraceful : public ucxNotificationAgent {
+protected:
+    nixl_b_params_t
+    backendParams(nixl_b_params_t params) const override {
+        params["ucx_error_handling_mode"] = "none";
+        return ucxNotificationAgent::backendParams(std::move(params));
+    }
+};
+
+TEST_P(ucxNotificationAgentGraceful, GenNotifThenDisconnectDeliversNotification) {
+    // Destroying the initiator right after the disconnect would cancel the
+    // notification, unless the disconnect waited for it
+    genNotifThenCleanup([this] {
+        invalidateReceiver();
+        sender_.reset();
+    });
+}
+
+// Two variants cover both engines and both progress modes
+INSTANTIATE_TEST_SUITE_P(ucx,
+                         ucxNotificationAgentGraceful,
+                         ::testing::Values(agentNotifParam{false, false},
+                                           agentNotifParam{true, true}),
+                         agentNotifParamName);
+
 INSTANTIATE_TEST_SUITE_P(ucx,
                          ucxNotificationAgent,
                          ::testing::Values(agentNotifParam{false, false},
                                            agentNotifParam{false, true},
                                            agentNotifParam{true, false},
                                            agentNotifParam{true, true}),
-                         [](const ::testing::TestParamInfo<agentNotifParam> &info) {
-                             return std::string(info.param.composite ? "Composite" : "Base") +
-                                 (info.param.progressThread ? "ProgressThread" : "Polling");
-                         });
+                         agentNotifParamName);
 
 } // namespace
