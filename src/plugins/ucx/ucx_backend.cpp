@@ -16,6 +16,7 @@
  */
 
 #include "ucx_backend.h"
+#include "am_drain.h"
 #include "ucx_proxy_engine.h"
 #include "ucx_thread_engine.h"
 #include "ucx_thread_pool_engine.h"
@@ -60,6 +61,18 @@ errHandlingModeFromParams(const nixl_b_params_t *custom_params) {
         custom_params, std::string(nixl_ucx_err_handling_param_name));
     return opt ? ucx_err_mode_from_string(*opt) : UCP_ERR_HANDLING_MODE_PEER;
 }
+
+[[nodiscard]] std::chrono::milliseconds
+notifDrainTimeoutFromParams(const nixl_b_params_t *custom_params) {
+    const auto timeout =
+        nixl::getBackendParamDefaulted(custom_params,
+                                       std::string(nixl_ucx_notif_drain_timeout_param_name),
+                                       nixl_ucx_notif_drain_timeout.count());
+    if (timeout < 0) {
+        throw std::invalid_argument("UCX notification drain timeout must be nonnegative");
+    }
+    return std::chrono::milliseconds(timeout);
+}
 } // namespace
 
 /****************************************
@@ -99,6 +112,7 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params, size_t nu
                             nixl_backend_capability_t::NOTIF |
                             nixl_backend_capability_t::TRACE_CONTEXT),
       errHandlingMode_(errHandlingModeFromParams(init_params.customParams)),
+      notifDrainTimeout_(notifDrainTimeoutFromParams(init_params.customParams)),
       sharedWorkerIndex_(1),
       sglEnabled_(sglEnabledFromConfig()),
       traceSink_(init_params.traceSink) {
@@ -189,6 +203,25 @@ nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
 
     if (it == remoteConnMap.end()) {
         return NIXL_ERR_NOT_FOUND;
+    }
+
+    // Closing an endpoint can cancel the notifications that genNotif() is
+    // still sending on it. Wait for them before the map drops the connection,
+    // until one deadline for all its endpoints: a request handle that still
+    // holds the connection closes the endpoints when it is released, without
+    // waiting. A zero timeout disables the wait, and so the warning.
+    if (notifDrainTimeout_.count() > 0) {
+        const auto deadline = nixl::ucx::amDrainDeadline(notifDrainTimeout_);
+        // Only its own thread may progress a dedicated worker, and genNotif()
+        // sends only on shared workers
+        const auto workers = getSharedWorkers();
+        for (size_t i = 0; i < workers.size(); ++i) {
+            const auto &ep = it->second->getEp(i);
+            if (!nixl::ucx::amDrainWait(workers[i]->get(), *ep->getAmSendStats(), deadline)) {
+                NIXL_WARN << "UCX AM drain timed out with " << ep->getPendingAmSends()
+                          << " pending sends on ep " << ep->getEp() << " to " << remote_agent;
+            }
+        }
     }
 
     // thread safety?

@@ -179,8 +179,36 @@ overridden before passing it to `createBackend` in C++ or `create_backend` in Py
 | ---------- | ------- | ----------- |
 | `ucx_error_handling_mode` | `peer` | UCX endpoint error handling policy. `peer` requests peer failure reporting; `none` disables it. |
 | `ucx_vram_memtype_hint` | `auto` | Controls how NIXL hints the UCX memory type during VRAM registration. Supported values are exactly: `auto`, `none`, `cuda`, `cuda-managed`, `rocm`, `ze-device`. |
+| `ucx_notif_drain_timeout_ms` | `1000` | How long invalidating a remote agent waits for the notifications that `genNotif()` is still sending to it, in milliseconds. `0` disables waiting. |
 
-The two options are independent; you do not need to set one to use the other.
+The options are independent; you do not need to set one to use the other.
+
+Before the UCX backend disconnects from a remote agent, it waits up to
+`ucx_notif_drain_timeout_ms` for the notifications that `genNotif()` is still
+sending to it. It disconnects, and so waits, only when NIXL invalidates the
+agent:
+
+- in `invalidateRemoteMD()`, which the metadata exchange also calls when a
+  remote agent invalidates its metadata;
+- in `loadRemoteMD()`, also when the metadata exchange calls it, if loading the
+  metadata of an agent fails and NIXL invalidates that agent.
+
+`invalidateRemoteMD()` and `loadRemoteMD()` wait while they hold the agent lock,
+so other calls on the agent wait as well: up to the timeout for each invalidated
+agent that still has such notifications in flight. `0` avoids this wait.
+
+Destroying the agent, and with it the backend, does not wait: the notifications
+still in flight can be lost. An application that needs them to arrive
+invalidates the remote agents before it destroys the agent.
+
+The wait is best effort. If it times out, for example because the peer does not
+progress, NIXL logs a warning, and the remaining notifications can be lost. The
+wait covers only the sends that UCX still reports in progress: a notification
+that UCX completed when it was posted, while the transport still buffers it,
+can be lost as well. A transfer request handle keeps its connection: if the
+application still holds one at disconnect, the endpoints of that connection,
+with the sends still outstanding on them, stay until the last such handle is
+released. Releasing the last such handle closes the endpoints without waiting.
 
 `ucx_error_handling_mode` affects UCP transport lane selection, not only error reporting.
 NIXL creates endpoints with `err_mode` set from this option, and UCP only selects lanes whose

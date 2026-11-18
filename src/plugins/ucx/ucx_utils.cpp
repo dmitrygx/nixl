@@ -41,6 +41,8 @@ get_ucx_backend_common_options() {
                    ucx_err_mode_to_string(UCP_ERR_HANDLING_MODE_PEER));
     params.emplace(nixl_ucx_vram_memtype_hint_param_name,
                    ucx_vram_memtype_hint_to_string(nixl_ucx_vram_memtype_hint_t::AUTO));
+    params.emplace(nixl_ucx_notif_drain_timeout_param_name,
+                   std::to_string(nixl_ucx_notif_drain_timeout.count()));
     return params;
 }
 

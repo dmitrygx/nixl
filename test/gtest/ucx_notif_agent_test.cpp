@@ -53,10 +53,14 @@ protected:
     static constexpr size_t descriptorCount = 8;
     static constexpr size_t descriptorBytes = 64;
     using buffer = std::array<unsigned char, descriptorBytes>;
+    // For slow runs, such as under sanitizers: a wait at disconnect ends as
+    // soon as the target takes the notification
+    static constexpr std::chrono::milliseconds drainTimeout{10000};
 
     // Backend parameters of both agents
     virtual nixl_b_params_t
     backendParams(nixl_b_params_t params) const {
+        params["ucx_notif_drain_timeout_ms"] = std::to_string(drainTimeout.count());
         return params;
     }
 
@@ -369,6 +373,17 @@ TEST_P(ucxNotificationAgent, GenNotifThenDisconnectWithLiveHandleDeliversNotific
     genNotifThenCleanup([this] { invalidateReceiver(); }, true);
 }
 
+TEST_P(ucxNotificationAgent, GenNotifThenAgentDestructionDoesNotWait) {
+    // Only disconnect waits for the notifications in flight: destroying the
+    // initiator closes its endpoints at once, although the paused target
+    // still holds back a notification
+    pauseReceiver();
+    ASSERT_EQ(NIXL_SUCCESS, sender_->genNotif(receiverName, std::string(1024 * 1024, 'd')));
+    const auto start = clock::now();
+    sender_.reset();
+    EXPECT_LT(clock::now() - start, drainTimeout / 2);
+}
+
 // Both agents close their endpoints gracefully, as UCX needs the same error
 // handling mode on both sides. The sends in flight on an endpoint that closes
 // stay with its worker, which cancels them when it is destroyed.
@@ -393,6 +408,71 @@ TEST_P(ucxNotificationAgentGraceful, GenNotifThenDisconnectDeliversNotification)
 // Two variants cover both engines and both progress modes
 INSTANTIATE_TEST_SUITE_P(ucx,
                          ucxNotificationAgentGraceful,
+                         ::testing::Values(agentNotifParam{false, false},
+                                           agentNotifParam{true, true}),
+                         agentNotifParamName);
+
+class ucxNotificationAgentNoDrain : public ucxNotificationAgent {
+protected:
+    nixl_b_params_t
+    backendParams(nixl_b_params_t params) const override {
+        params["ucx_notif_drain_timeout_ms"] = "0";
+        return params;
+    }
+};
+
+TEST_P(ucxNotificationAgentNoDrain, GenNotifThenDisconnectDoesNotWait) {
+    // A timeout of 0 disables waiting, and so the warning
+    const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
+    pauseReceiver();
+    ASSERT_EQ(NIXL_SUCCESS, sender_->genNotif(receiverName, std::string(1024 * 1024, 'z')));
+    EXPECT_FALSE(cleanupWaitsForReceiver([this] { invalidateReceiver(); }))
+        << "The disconnect waited for the outstanding notification";
+    EXPECT_EQ(0, timeout.getIgnoredCount());
+}
+
+INSTANTIATE_TEST_SUITE_P(ucx,
+                         ucxNotificationAgentNoDrain,
+                         ::testing::Values(agentNotifParam{false, false},
+                                           agentNotifParam{true, true}),
+                         agentNotifParamName);
+
+// Two shared workers on each agent, besides the two dedicated workers of the
+// composite case, and a short drain timeout
+class ucxNotificationAgentShortDrain : public ucxNotificationAgent {
+protected:
+    static constexpr std::chrono::milliseconds shortTimeout{500};
+
+    nixl_b_params_t
+    backendParams(nixl_b_params_t params) const override {
+        params["num_workers"] = GetParam().composite ? "4" : "2";
+        params["ucx_notif_drain_timeout_ms"] = std::to_string(shortTimeout.count());
+        return params;
+    }
+};
+
+TEST_P(ucxNotificationAgentShortDrain, GenNotifThenDisconnectStopsAtOneDeadline) {
+    // Threads take the shared workers in turn, so two threads send a
+    // notification each on a different endpoint. The paused target takes
+    // neither: disconnect waits for both until one deadline, warns for each
+    // and still disconnects.
+    const gtest::LogIgnoreGuard timeout("UCX AM drain timed out with.*pending sends");
+    const std::string notification(1024 * 1024, 't');
+    pauseReceiver();
+    ASSERT_EQ(NIXL_SUCCESS, sender_->genNotif(receiverName, notification));
+    nixl_status_t status = NIXL_ERR_UNKNOWN;
+    std::thread([&] { status = sender_->genNotif(receiverName, notification); }).join();
+    ASSERT_EQ(NIXL_SUCCESS, status);
+    const auto start = clock::now();
+    invalidateReceiver();
+    const auto elapsed = clock::now() - start;
+    EXPECT_GE(elapsed, shortTimeout);
+    EXPECT_LT(elapsed, 2 * shortTimeout);
+    EXPECT_EQ(2, timeout.getIgnoredCount());
+}
+
+INSTANTIATE_TEST_SUITE_P(ucx,
+                         ucxNotificationAgentShortDrain,
                          ::testing::Values(agentNotifParam{false, false},
                                            agentNotifParam{true, true}),
                          agentNotifParamName);

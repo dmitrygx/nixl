@@ -320,6 +320,7 @@ private:
     std::vector<std::unique_ptr<nixlUcxWorker>> workers_;
     size_t numSharedWorkers_;
     const ucp_err_handling_mode_t errHandlingMode_;
+    const std::chrono::milliseconds notifDrainTimeout_;
     std::string workerAddr;
     mutable std::atomic<size_t> sharedWorkerIndex_;
     const bool sglEnabled_;

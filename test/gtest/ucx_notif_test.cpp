@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "am_drain.h"
 #include "common.h"
 #include "common/hw_info.h"
 #include "ucx_backend_req.h"
@@ -21,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -223,6 +225,25 @@ TEST_F(ucxNotification, DestroyWorkerWithPendingNotificationNone) {
     destroyPending(UCP_ERR_HANDLING_MODE_NONE);
 }
 
+TEST_F(ucxNotification, DrainWaitStopsAtDeadline) {
+    using milliseconds = std::chrono::milliseconds;
+    const auto ep_stats = ep_->getAmSendStats();
+    // Nothing is pending: even the longest timeout ends at once
+    EXPECT_TRUE(nixl::ucx::amDrainWait(
+        sender_->get(), *ep_stats, nixl::ucx::amDrainDeadline(milliseconds::max())));
+    // The receiver does not progress, so the send stays pending
+    ASSERT_EQ(NIXL_IN_PROG, send(std::string(large_payload_size, 'n')));
+    EXPECT_FALSE(nixl::ucx::amDrainWait(
+        sender_->get(), *ep_stats, nixl::ucx::amDrainDeadline(milliseconds(0))));
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(nixl::ucx::amDrainWait(
+        sender_->get(), *ep_stats, nixl::ucx::amDrainDeadline(milliseconds(20))));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(elapsed, milliseconds(20));
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(1, ep_stats->pending());
+}
+
 // Established RC connections: the send is posted to the NIC, not only queued
 class ucxNotificationRc : public ucxNotification {
 protected:
@@ -363,6 +384,52 @@ TEST_F(ucxNotificationMt, ConcurrentSendProgressAndTeardown) {
         EXPECT_FALSE(seen[id]);
         seen[id] = true;
         EXPECT_TRUE(gtest::checkPayload(received_.data() + offset, payload_size, id, seed));
+    }
+}
+
+TEST(ucxNotificationConfig, InvalidDrainTimeoutRejected) {
+    nixlBackendInitParams init;
+    init.localAgent = "notif-config";
+    init.type = "UCX";
+    init.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE;
+    nixl_b_params_t params;
+    init.customParams = &params;
+    params["ucx_notif_drain_timeout_ms"] = "-1";
+    EXPECT_THROW((void)nixlUcxEngine::create(init), std::invalid_argument);
+    for (const auto *value : {"invalid", "1.5", "999999999999999999999999999999"}) {
+        params = {{"ucx_notif_drain_timeout_ms", value}};
+        EXPECT_THROW((void)nixlUcxEngine::create(init), std::runtime_error);
+    }
+}
+
+TEST(ucxNotificationConfig, ZeroAndMaximumDrainTimeoutAreAccepted) {
+    gtest::ScopedEnv env;
+    env.addVar("UCX_TLS", gtest::ucxTls("tcp"));
+    const gtest::LogIgnoreGuard gpu_warning(
+        "GPU\\(s\\) were detected, but UCX (CUDA|ROCm) support was not found");
+    nixl_b_params_t params{{"engine_config", "TLS=tcp"}};
+    nixlBackendInitParams init;
+    init.localAgent = "notif-zero-config";
+    init.type = "UCX";
+    init.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE;
+    init.customParams = &params;
+    for (const auto timeout : {std::chrono::milliseconds(0), std::chrono::milliseconds::max()}) {
+        params["ucx_notif_drain_timeout_ms"] = std::to_string(timeout.count());
+        EXPECT_NO_THROW((void)nixlUcxEngine::create(init));
+    }
+}
+
+TEST(ucxNotificationConfig, DrainDeadlineSaturatesWithoutOverflow) {
+    using clock = std::chrono::steady_clock;
+    using milliseconds = std::chrono::milliseconds;
+    EXPECT_EQ(clock::time_point::max(), nixl::ucx::amDrainDeadline(milliseconds::max()));
+    for (const auto timeout : {milliseconds::min(), milliseconds(0), milliseconds(20)}) {
+        const auto before = clock::now();
+        const auto deadline = nixl::ucx::amDrainDeadline(timeout);
+        const auto after = clock::now();
+        const auto increment = std::max(timeout, milliseconds(0));
+        EXPECT_LE(before + increment, deadline);
+        EXPECT_LE(deadline, after + increment);
     }
 }
 

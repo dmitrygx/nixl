@@ -18,6 +18,7 @@
 #define NIXL_SRC_UTILS_UCX_UCX_UTILS_H
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string_view>
 #include <type_traits>
@@ -43,6 +44,9 @@ enum class nixl_ucx_vram_memtype_hint_t {
 
 inline constexpr std::string_view nixl_ucx_err_handling_param_name = "ucx_error_handling_mode";
 inline constexpr std::string_view nixl_ucx_vram_memtype_hint_param_name = "ucx_vram_memtype_hint";
+inline constexpr std::string_view nixl_ucx_notif_drain_timeout_param_name =
+    "ucx_notif_drain_timeout_ms";
+inline constexpr std::chrono::milliseconds nixl_ucx_notif_drain_timeout{1000};
 
 // The API `ucp_context_query(ctx, &attr)` sets `UCS_MEMORY_TYPE_RDMA` in `attr.memory_types`
 // field only from UCX 1.22
